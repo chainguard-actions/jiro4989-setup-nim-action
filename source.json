@@ -1,0 +1,11 @@
+{
+  "owner": "jiro4989",
+  "repo": "setup-nim-action",
+  "version": "v2.5.1",
+  "commit_sha": "08957181dc5baf5f8446497598f798020a03e66a",
+  "url": "https://github.com/jiro4989/setup-nim-action",
+  "policy_sha": "374911c4be584df24e6da57af2d990570ef0f859",
+  "test_policy_sha": "843adf9e4b8f85d0c08b27b9d0b09dd094b54702",
+  "test_agent_version": "2",
+  "harden_agent_version": "2"
+}

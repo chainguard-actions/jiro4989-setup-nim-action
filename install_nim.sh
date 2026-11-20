@@ -1,0 +1,241 @@
+#!/bin/bash
+
+set -eu
+
+# shellcheck source=lib/lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/lib.sh"
+
+DATE_FORMAT="%Y-%m-%d %H:%M:%S"
+CURL_OPTION=(-sSL --connect-timeout 10 --max-time 120 --retry 3)
+
+fetch_tags() {
+  # https://docs.github.com/ja/rest/git/refs?apiVersion=2022-11-28
+  curl \
+    -H "Accept: application/vnd.github+json" \
+    -H "Authorization: Bearer ${repo_token}" \
+    -H "X-GitHub-Api-Version: 2022-11-28" https://api.github.com/repos/nim-lang/nim/git/refs/tags |
+    jq -r '.[].ref' |
+    sed -E 's:^refs/tags/v::'
+}
+
+fetch_nightlies_releases() {
+  # https://docs.github.com/en/rest/releases/releases?apiVersion=2022-11-28
+  curl "${CURL_OPTION[@]}" \
+    -H "Accept: application/vnd.github+json" \
+    -H "Authorization: Bearer ${repo_token}" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    https://api.github.com/repos/nim-lang/nightlies/releases
+}
+
+info() {
+  echo "$(date +"$DATE_FORMAT") [INFO] $*"
+}
+
+err() {
+  echo "$(date +"$DATE_FORMAT") [ERR] $*"
+}
+
+move_nim_compiler() {
+  src_dir="$1"
+  dst_dir="$2"
+  if [[ -d "$dst_dir" ]]; then
+    info "remove cached directory (path = $dst_dir)"
+    rm -rf "$dst_dir"
+  fi
+  mv "$src_dir" "$dst_dir"
+}
+
+# Build Nimble from a specific commit and replace the bundled binary.
+# https://github.com/status-im/nimbus-build-system/blob/d82132fa4b47e1721657faee4737a1f92df0c994/scripts/build_nim.sh#L209-L242
+install_custom_nimble() {
+  if [[ -z "${nimble_commit}" ]]; then
+    return 0
+  fi
+
+  exe_suffix=""
+  if [[ "${os}" = Windows ]]; then
+    exe_suffix=".exe"
+  fi
+
+  nim_root="${PWD}/${nim_install_dir}"
+  nim_bin="${nim_root}/bin/nim${exe_suffix}"
+  nimble_bin="${nim_root}/bin/nimble${exe_suffix}"
+
+  info "build nimble (commit = ${nimble_commit})"
+  nimble_build_dir="$(mktemp -d)"
+  git clone -q https://github.com/nim-lang/nimble.git "${nimble_build_dir}"
+  pushd "${nimble_build_dir}"
+  if ! git checkout -q "${nimble_commit}"; then
+    err "wrong nimble commit specified: ${nimble_commit}"
+    exit 1
+  fi
+  git submodule update --init --recursive
+
+  info "compile nimble"
+  "${nim_bin}" c -d:release --skipUserCfg --skipParentCfg --noNimblePath -d:lto src/nimble
+
+  if [[ -f "src/nimble${exe_suffix}" ]]; then
+    info "replace nimble binary (path = ${nimble_bin})"
+    rm -f "${nimble_bin}"
+    cp "src/nimble${exe_suffix}" "${nimble_bin}"
+  else
+    err "nimble build failed"
+    exit 1
+  fi
+  popd
+  rm -rf "${nimble_build_dir}"
+
+  # Nimble needs a CA cert beside the binary.
+  if [[ ! -r "${nim_root}/bin/cacert.pem" ]]; then
+    curl "${CURL_OPTION[@]}" -o "${nim_root}/bin/cacert.pem" https://curl.se/ca/cacert.pem ||
+      info "failed to download a CA cert needed by nimble"
+  fi
+}
+
+# parse commandline args
+nim_version="stable"
+nim_install_dir=".nim_runtime"
+os="Linux"
+repo_token=""
+parent_nim_install_dir=""
+use_nightlies="false"
+nimble_commit=""
+while ((0 < $#)); do
+  opt=$1
+  shift
+  case $opt in
+    --nim-version)
+      nim_version=$1
+      ;;
+    --nim-install-directory)
+      nim_install_dir=$1
+      ;;
+    --parent-nim-install-directory)
+      parent_nim_install_dir=$1
+      ;;
+    --os)
+      os=$1
+      ;;
+    --repo-token)
+      repo_token=$1
+      ;;
+    --use-nightlies)
+      use_nightlies=$1
+      ;;
+    --nimble-commit)
+      nimble_commit=$1
+      ;;
+  esac
+done
+
+if [[ "$parent_nim_install_dir" = "" ]]; then
+  parent_nim_install_dir="$PWD"
+fi
+
+cd "$parent_nim_install_dir"
+
+# build nim compiler for devel branch
+if [[ "$nim_version" = "devel" ]]; then
+  if [[ "$use_nightlies" = true ]]; then
+    target="linux_x64"
+    if [[ "$os" = macOS ]]; then
+      target="macosx_x64"
+    elif [[ "$os" = Windows ]]; then
+      target="windows_x64"
+    fi
+
+    work_dir="/tmp/setup_nim_action_work"
+    mkdir -p "$work_dir"
+    pushd "$work_dir"
+
+    fetch_nightlies_releases > releases.json
+    filter_latest_devel_assets releases.json > assets.json
+    filter_os_asset "$target" assets.json > os_asset.json
+    asset_name="$(jq -r '.name' os_asset.json)"
+    browser_download_url="$(jq -r '.browser_download_url' os_asset.json)"
+    if [[ -z "$asset_name" ]] || [[ "$asset_name" = null ]]; then
+      err "no nightlies asset found (target = $target)"
+      exit 1
+    fi
+    info "download nightlies build: asset_name = $asset_name, browser_download_url = $browser_download_url"
+    # asset_name ex: linux_x64.tar.xz / windows_x64.zip
+    curl "${CURL_OPTION[@]}" "$browser_download_url" > "$asset_name"
+    mkdir -p outfiles
+    case "$asset_name" in
+      *.zip)
+        unzip -q "$asset_name" -d outfiles
+        # strip the single top-level directory (same as tar --strip-components=1)
+        top_dir="$(find outfiles -mindepth 1 -maxdepth 1 -type d)"
+        mv "$top_dir"/* outfiles/
+        rmdir "$top_dir"
+        ;;
+      *)
+        tar xf "$asset_name" -C outfiles --strip-components=1
+        ;;
+    esac
+    rm -f "$asset_name"
+
+    popd
+    move_nim_compiler "${work_dir}/outfiles" "${nim_install_dir}"
+    rm -rf "$work_dir"
+  else
+    git clone -b devel --depth 1 https://github.com/nim-lang/Nim
+    cd Nim
+    info "build nim compiler (devel)"
+    ./build_all.sh
+    cd ..
+    move_nim_compiler Nim "${nim_install_dir}"
+  fi
+
+  install_custom_nimble
+  exit
+fi
+
+# get exact version of stable
+if [[ "$nim_version" = "stable" ]]; then
+  nim_version=$(curl "${CURL_OPTION[@]}" https://nim-lang.org/channels/stable)
+elif [[ "$nim_version" =~ ^[0-9]+\.[0-9]+\.x$ ]] || [[ "$nim_version" =~ ^[0-9]+\.x$ ]]; then
+  nim_version="$(fetch_tags | grep -E "$(tag_regexp "$nim_version")" | latest_version)"
+fi
+
+info "install nim $nim_version"
+
+# download nim compiler
+arch="x64"
+if [[ "$os" = Windows ]]; then
+  download_url="https://nim-lang.org/download/nim-${nim_version}_${arch}.zip"
+  curl "${CURL_OPTION[@]}" "${download_url}" > nim.zip
+  unzip -q nim.zip
+  rm -f nim.zip
+elif [[ "$os" = "Linux" && "$HOSTTYPE" = "x86_64" ]]; then
+  download_url="https://nim-lang.org/download/nim-${nim_version}-linux_${arch}.tar.xz"
+  curl "${CURL_OPTION[@]}" "${download_url}" > nim.tar.xz
+  tar xf nim.tar.xz
+  rm -f nim.tar.xz
+else
+  # need to build compiler
+  download_url="https://nim-lang.org/download/nim-${nim_version}.tar.xz"
+  curl "${CURL_OPTION[@]}" "${download_url}" > nim.tar.xz
+  tar xf nim.tar.xz
+  rm -f nim.tar.xz
+
+  # homebrew: https://github.com/Homebrew/homebrew-core/blob/736836cf038c04e304e635ccd04dcd0bdff8f57b/Formula/n/nim.rb
+  # nim: https://github.com/nim-lang/Nim/blob/devel/build_all.sh
+  cd "nim-${nim_version}"
+
+  info "build nim compiler"
+  ./build.sh
+
+  info "build koch tool"
+  ./bin/nim c --noNimblePath --skipUserCfg --skipParentCfg --hints:off koch
+
+  info "koch boot"
+  ./koch boot -d:release --skipUserCfg --skipParentCfg --hints:off
+
+  info "koch tools"
+  ./koch tools --skipUserCfg --skipParentCfg --hints:off
+
+  cd ..
+fi
+move_nim_compiler "nim-${nim_version}" "${nim_install_dir}"
+install_custom_nimble
