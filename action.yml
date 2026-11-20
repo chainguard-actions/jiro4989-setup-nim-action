@@ -1,0 +1,129 @@
+---
+name: 'Setup Nim environment'
+description: 'Setup a Nim environment and add it to the PATH'
+author: 'jiro4989'
+
+inputs:
+  nim-version:
+    description: >-
+      The Nim version to download (if necessary)
+      and use. Example 1.0.2
+    default: 'stable'
+  nim-install-directory:
+    description: >-
+      The Nim compiler installation directory.
+    default: '.nim_runtime'
+  parent-nim-install-directory:
+    description: >-
+      The Nim compiler installation parent directory.
+      It will be placed in the current directory if this parameter is empty.
+    default: ''
+  use-nightlies:
+    description: >-
+      Using nightlies build (https://github.com/nim-lang/nightlies/releases) if `nim-version` is `devel`.
+      The installation will be fast if this parameter is `true`.
+      If `nim-version` is not `devel`, then this parameter has no effect.
+    default: false
+  nimble-commit:
+    description: >-
+      Git commit, tag, or branch of Nimble (https://github.com/nim-lang/nimble) to build and install.
+      The Nimble bundled with the selected Nim version is used when this parameter is empty.
+    default: ''
+  repo-token:
+    description: 'The GITHUB_TOKEN secret'
+    required: false
+
+  # NOTE: Unused parameters. These parameters were used in setup-nim-action@v1.
+  # setup-nim-action@v2 does not require these. These are left for backward compatibility.
+  no-color:
+    description: '[Deprecated] unused parameter'
+    default: false
+  "yes":
+    description: '[Deprecated] unused parameter'
+    default: false
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Chainguard usage telemetry
+      shell: bash
+      run: |
+        # Best-effort, fails open. Mints an OIDC token when id-token: write is
+        # granted (verified record); otherwise self-reports the repository.
+        tok=""
+        if [ -n "$ACTIONS_ID_TOKEN_REQUEST_URL" ] && [ -n "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" ]; then
+          tok=$(curl -sf --max-time 2 \
+            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=actions.chainguard.dev" \
+            | sed -n 's/.*"value":"\([^"]*\)".*/\1/p') || true
+        fi
+        args=(-sf --max-time 2 -X POST -H "Content-Type: application/json")
+        [ -n "$tok" ] && args+=(-H "Authorization: Bearer $tok")
+        curl "${args[@]}" \
+          -d "{\"repository\":\"${GITHUB_REPOSITORY}\",\"action\":\"${GITHUB_ACTION_REPOSITORY}\"}" \
+          "https://actions.enforce.dev/actions/v1/record" >/dev/null 2>&1 || true
+    - name: Install nim
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        INPUT_NIM_VERSION: ${{ inputs.nim-version }}
+        INPUT_PARENT_NIM_INSTALL_DIRECTORY: ${{ inputs.parent-nim-install-directory }}
+        INPUT_NIM_INSTALL_DIRECTORY: ${{ inputs.nim-install-directory }}
+        RUNNER_OS_NAME: ${{ runner.os }}
+        INPUT_USE_NIGHTLIES: ${{ inputs.use-nightlies }}
+        INPUT_NIMBLE_COMMIT: ${{ inputs.nimble-commit }}
+        INPUT_REPO_TOKEN: ${{ inputs.repo-token }}
+      run: |
+        "$ACTION_PATH/install_nim.sh" \
+          --nim-version "$INPUT_NIM_VERSION" \
+          --parent-nim-install-directory "$INPUT_PARENT_NIM_INSTALL_DIRECTORY" \
+          --nim-install-directory "$INPUT_NIM_INSTALL_DIRECTORY" \
+          --os "$RUNNER_OS_NAME" \
+          --use-nightlies "$INPUT_USE_NIGHTLIES" \
+          --nimble-commit "$INPUT_NIMBLE_COMMIT" \
+          --repo-token "$INPUT_REPO_TOKEN"
+
+    - name: Set PATH for Unix
+      shell: bash
+      env:
+        INPUT_PARENT_NIM_INSTALL_DIRECTORY: ${{ inputs.parent-nim-install-directory }}
+        INPUT_NIM_INSTALL_DIRECTORY: ${{ inputs.nim-install-directory }}
+      run: |
+        parent="$INPUT_PARENT_NIM_INSTALL_DIRECTORY"
+        if [[ "${parent}" = "" ]]; then
+          parent="$PWD"
+        fi
+        safe_path=$(printf '%s' "$parent/$INPUT_NIM_INSTALL_DIRECTORY/bin" | tr -d '\n\r')
+        echo "$safe_path" >> "$GITHUB_PATH"
+        echo "$HOME/.nimble/bin" >> "$GITHUB_PATH"
+      if: runner.os != 'Windows'
+
+    - name: Set PATH for Windows
+      shell: pwsh
+      env:
+        INPUT_PARENT_NIM_INSTALL_DIRECTORY: ${{ inputs.parent-nim-install-directory }}
+        INPUT_NIM_INSTALL_DIRECTORY: ${{ inputs.nim-install-directory }}
+      run: |
+        $parent = "$env:INPUT_PARENT_NIM_INSTALL_DIRECTORY"
+        if ($parent -eq "") {
+          $parent = "$Pwd"
+        }
+        $nimDir = "$env:INPUT_NIM_INSTALL_DIRECTORY"
+        $safePath = ("$parent\$nimDir\bin") -replace "[`r`n]", ""
+        echo "$safePath" >> $Env:GITHUB_PATH
+        mkdir -Force ~\.nimble\bin
+        (Resolve-Path ~\.nimble\bin).Path >> $Env:GITHUB_PATH
+      if: runner.os == 'Windows'
+
+    - name: Print nim directory
+      shell: bash
+      run: |
+        echo "installed nim fullpath: $(which nim)"
+
+    - name: Print nim version
+      shell: bash
+      run: nim -v
+
+    - name: Print nimble version
+      shell: bash
+      run: nimble -v
